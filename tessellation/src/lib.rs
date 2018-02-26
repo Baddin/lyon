@@ -194,6 +194,7 @@ mod path_fill;
 mod path_stroke;
 mod math_utils;
 mod fixed;
+mod experimental;
 
 #[cfg(test)]
 mod earcut_tests;
