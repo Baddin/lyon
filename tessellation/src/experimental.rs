@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use {FillOptions, FillRule};
 use geom::math::*;
 use geom::LineSegment;
-use geometry_builder::{GeometryBuilder, Count, VertexId};
+use geometry_builder::{GeometryBuilder, VertexId};
 use std::ops::Range;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -32,6 +32,14 @@ pub struct Path {
 }
 
 impl Path {
+    pub fn new() -> Self {
+        Path {
+            points: Vec::new(),
+            segments: Vec::new(),
+            sub_paths: Vec::new(),
+        }
+    }
+
     fn previous_segment(&self, id: SegmentId) -> SegmentId {
         let idx = id.0 as usize;
         for sp in &self.sub_paths {
@@ -87,6 +95,12 @@ pub struct Builder {
 }
 
 impl Builder {
+    pub fn new() -> Self {
+        Builder {
+            path: Path::new(),
+        }
+    }
+
     pub fn quadartic_bezier_to(&mut self, ctrl_pos: Point, to_pos: Point) {
         if self.path.points.is_empty() {
             self.path.points.push(point(0.0, 0.0));
@@ -165,8 +179,8 @@ impl Events {
 
         self.sorted.sort_by(|a, b| {
             compare_positions(
-                event_positions[a.to_usize()],
-                event_positions[b.to_usize()]
+                event_positions[b.to_usize()],
+                event_positions[a.to_usize()]
             )
         });
     }
@@ -234,7 +248,24 @@ impl ActiveEdge {
 }
 
 impl FillTessellator {
-    pub fn tessellate_path(&mut self, path: &Path) {
+    pub fn new() -> Self {
+        FillTessellator {
+            active_edges: Vec::new(),
+            pending_edges: Vec::new(),
+            options: FillOptions::default(),
+            events: Events {
+                sorted: Vec::new(),
+            },
+        }
+    }
+
+    pub fn tessellate_path(
+        &mut self,
+        path: &Path,
+        options: &FillOptions,
+    ) {
+        self.options = options.clone();
+
         self.events.set_path(path);
 
         self.tessellator_loop(path);
@@ -309,13 +340,19 @@ impl FillTessellator {
         current_vertex_id: VertexId,
         edges_above: u32,
     ) {
+        println!(" --- events at {} {}                       {}/{}",
+            current_pos.x, current_pos.y,
+            self.pending_edges.len(), edges_above
+        );
+
         let mut winding = WindingState {
             span_index: 0,
             number: 0,
             transition: Transition::None,
         };
         let mut winding_below = None;
-        let mut first_active_edge = self.active_edges.len();
+        let mut connecting_edge_start = self.active_edges.len();
+        let mut connecting_edge_end = self.active_edges.len();
         let mut connecting_edges = false;
         let mut first_transition_above = true;
         let mut pending_merge = None;
@@ -346,14 +383,14 @@ impl FillTessellator {
                 }
 
                 if ex > current_pos.x {
-                    first_active_edge = i;
+                    connecting_edge_end = i;
                     break;
                 }
             }
 
             if !was_connecting_edges && connecting_edges {
                 winding_below = Some(winding.clone());
-                first_active_edge = i;
+                connecting_edge_start = i;
             }
 
             self.update_winding(&mut winding, active_edge.winding);
@@ -373,6 +410,8 @@ impl FillTessellator {
                             pending_right = Some(i);
                         }
                     } else if let Some(in_idx) = prev_transition_in.take() {
+
+                        println!(" ** end ** edges: [{}, ??] span: {}", in_idx, winding.span_index);
 
                         //self.end_event(in_idx, i, winding.span_index);
 
@@ -404,6 +443,7 @@ impl FillTessellator {
             //   ...x
             //   ....\
             //
+            println!(" ** right ** edge: {} span: {}", idx, winding.span_index);
 
             self.pending_edges.remove(0);
         } else if let Some(in_idx) = pending_merge {
@@ -416,6 +456,7 @@ impl FillTessellator {
 
             //let out_idx =
             //self.merge_event(in_idx, out_idx, winding.span_index);
+            println!(" ** merge ** edges: [{}, ??] span: {}", in_idx, winding.span_index);
 
             self.pending_edges.remove(0);
             self.pending_edges.pop();
@@ -426,6 +467,8 @@ impl FillTessellator {
             //    x....
             //     \...
             //
+
+            println!(" ** left ** edge ?? span: {}", winding.span_index);
 
             self.pending_edges.pop();
         }
@@ -440,6 +483,7 @@ impl FillTessellator {
                 Transition::Out => {
                     if let Some(in_idx) = prev_transition_in {
 
+                        println!(" ** start ** edges: [{}, {}] span: {}", in_idx, i, winding.span_index);
                         //self.start_event(in_idx, i, winding.span_index);
 
                     }
@@ -447,12 +491,40 @@ impl FillTessellator {
                 Transition::None => {}
             }
         }
-    }
 
-    fn start_event(&mut self, in_idx: usize, out_idx: usize, span_index: usize) {
-    }
+        let num_edges_to_remove = connecting_edge_end as i32 - connecting_edge_start as i32;
+        let num_edges_to_add = self.pending_edges.len();
 
-    fn end_event(&mut self, in_idx: usize, out_idx: usize, span_index: usize) {
+        if num_edges_to_remove > 0 {
+            for _ in 0..num_edges_to_remove {
+                self.active_edges.remove(connecting_edge_start);
+            }
+        }
+
+        if num_edges_to_add > 0 {
+            let offset = usize::min(connecting_edge_start, connecting_edge_end);
+            for i in 0..num_edges_to_add {
+                let e = &self.pending_edges[offset + i];
+                self.active_edges.insert(offset + i, ActiveEdge {
+                    from: e.from,
+                    to: e.to,
+                    ctrl: e.ctrl,
+
+                    range_start: e.range_start,
+
+                    from_id: e.from_id,
+                    ctrl_id: e.ctrl_id,
+                    to_id: e.to_id,
+
+                    winding: e.winding,
+                    is_merge: false,
+                });
+            }
+        }
+
+        self.pending_edges.clear();
+
+        println!("                                        sl.len: {}", self.active_edges.len());
     }
 
     fn sort_ending_edges(&mut self) {
@@ -510,4 +582,28 @@ fn compare_positions(a: Point, b: Point) -> Ordering {
 #[inline]
 fn is_after(a: Point, b: Point) -> bool {
     a.y > b.y || (a.y == b.y && a.x > b.x)
+}
+
+#[test]
+fn new_tess() {
+    println!("");
+
+    let mut builder = Builder::new();
+    builder.move_to(point(0.0, 0.0));
+    builder.line_to(point(5.0, -5.0));
+    builder.line_to(point(10.0, 0.0));
+    builder.line_to(point(9.0, 5.0));
+    builder.line_to(point(10.0, 10.0));
+    builder.line_to(point(5.0, 6.0));
+    builder.line_to(point(0.0, 10.0));
+    builder.line_to(point(1.0, 5.0));
+    builder.close();
+
+    let path = builder.build();
+
+    let mut tess = FillTessellator::new();
+
+    tess.tessellate_path(&path, &FillOptions::default());
+
+    panic!();
 }
