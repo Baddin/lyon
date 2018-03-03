@@ -202,8 +202,9 @@ impl Builder {
 pub struct FillTessellator {
     active: ActiveEdges,
     pending_edges: Vec<PendingEdge>,
-    options: FillOptions,
+    fill_rule: FillRule,
     events: Vec<Event>,
+    spans: Spans,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -218,6 +219,32 @@ struct WindingState {
     span_index: usize,
     number: i16,
     transition: Transition,
+}
+
+impl FillRule {
+    fn is_in(&self, winding_number: i16) -> bool {
+        match *self {
+            FillRule::EvenOdd => { winding_number % 2 != 0 }
+            FillRule::NonZero => { winding_number != 0 }
+        }
+    }
+
+    fn transition(&self, prev_winding: i16, new_winding: i16) -> Transition {
+        match (self.is_in(prev_winding), self.is_in(new_winding)) {
+            (false, true) => Transition::In,
+            (true, false) => Transition::Out,
+            _ => Transition::None,
+        }
+    }
+
+    fn update_winding(&self, winding: &mut WindingState, edge_winding: i16) {
+        let prev_winding_number = winding.number;
+        winding.number += edge_winding;
+        winding.transition = self.transition(prev_winding_number, winding.number);
+        if winding.transition == Transition::In {
+            winding.span_index += 1;
+        }
+    }
 }
 
 struct ActiveEdge {
@@ -242,30 +269,21 @@ struct ActiveEdges {
     aux: Vec<ActiveEdgeAux>,
 }
 
-impl ActiveEdges {
-    fn insert(&mut self, idx: usize, e: &PendingEdge) {
-        self.edges.insert(idx, ActiveEdge {
-            from: e.from,
-            to: e.to,
-            ctrl: e.ctrl,
-            range_start: e.range_start,
-            winding: e.winding,
-            is_merge: false,
-        });
+type SpanIdx = usize;
 
-        self.aux.insert(idx, ActiveEdgeAux {
-            from_id: e.from_id,
-            to_id: e.to_id,
-            ctrl_id: e.ctrl_id,
-        });
+struct Span;
+
+struct Spans {
+    spans: Vec<Span>,
+}
+
+impl Spans {
+    fn end(&mut self, idx: SpanIdx) {
+        // TODO
     }
 
-    fn remove(&mut self, range: Range<usize>) {
-        let count = range.end - range.start;
-        for _ in 0..count {
-            self.edges.remove(range.start);
-            self.aux.remove(range.start);
-        }
+    fn begin(&mut self, idx: SpanIdx, left: &PendingEdge, right: &PendingEdge) {
+        // TODO
     }
 }
 
@@ -302,8 +320,11 @@ impl FillTessellator {
                 aux: Vec::new(),
             },
             pending_edges: Vec::new(),
-            options: FillOptions::default(),
+            fill_rule: FillRule::EvenOdd,
             events: Vec::new(),
+            spans: Spans {
+                spans: Vec::new(),
+            }
         }
     }
 
@@ -312,11 +333,15 @@ impl FillTessellator {
         path: &Path,
         options: &FillOptions,
     ) {
-        self.options = options.clone();
+        self.fill_rule = options.fill_rule;
 
         path.sort(&mut self.events);
 
         self.tessellator_loop(path);
+
+        assert!(self.active.edges.is_empty());
+
+        println!("\n ***************** \n");
     }
 
     fn tessellator_loop(&mut self, path: &Path) {
@@ -386,7 +411,7 @@ impl FillTessellator {
     fn process_events(
         &mut self,
         current_pos: Point,
-        _current_vertex_id: VertexId,
+        current_vertex_id: VertexId,
         edges_above: u32,
     ) {
         println!("");
@@ -410,14 +435,22 @@ impl FillTessellator {
 
         // First go through the sweep line until we find an edge that touches
         // the current position.
-        for (i, active_edge) in self.active.edges.iter().enumerate() {
+        for (i, active_edge) in self.active.edges.iter_mut().enumerate() {
             if active_edge.is_merge {
-                continue;
+                if !connecting_edges {
+                    continue;
+                } else {
+                    println!(" Resolve merge event {} at {:?}", i, active_edge.to);
+                    // Resolve this merge vertex.
+                    active_edge.is_merge = false;
+                    active_edge.to = current_pos;
+                    self.active.aux[i].to_id = current_vertex_id;
+                }
             }
 
             let was_connecting_edges = connecting_edges;
 
-            if self.points_are_equal(current_pos, active_edge.to) {
+            if points_are_equal(current_pos, active_edge.to) {
                 if !connecting_edges {
                     debug_assert!(edges_above != 0);
                     connecting_edges = true;
@@ -444,7 +477,7 @@ impl FillTessellator {
                 above.start = i;
             }
 
-            self.update_winding(&mut winding, active_edge.winding);
+            self.fill_rule.update_winding(&mut winding, active_edge.winding);
 
             if !connecting_edges {
                 continue;
@@ -469,6 +502,7 @@ impl FillTessellator {
                             winding.span_index
                         );
 
+                        self.spans.end(winding.span_index);
                     } else {
                         // TODO: ??
                         unimplemented!();
@@ -518,7 +552,18 @@ impl FillTessellator {
                 winding.span_index
             );
 
-        } else if !self.is_inside(winding.number) && self.pending_edges.len() % 2 == 1 {
+            let e = &mut self.active.edges[in_idx];
+
+            e.is_merge = true;
+            e.from = e.to;
+            e.ctrl = e.to;
+            e.winding = 0;
+
+            let aux = &mut self.active.aux[in_idx];
+            aux.from_id = aux.to_id;
+            aux.ctrl_id = aux.to_id;
+
+        } else if !self.fill_rule.is_in(winding.number) && self.pending_edges.len() % 2 == 1 {
             // Left event.
             //
             //     /...
@@ -533,7 +578,7 @@ impl FillTessellator {
         // start events.
 
         for (i, pending_edge) in self.pending_edges.iter().enumerate() {
-            self.update_winding(&mut winding, pending_edge.winding);
+            self.fill_rule.update_winding(&mut winding, pending_edge.winding);
 
             match winding.transition {
                 Transition::In => {
@@ -544,6 +589,11 @@ impl FillTessellator {
 
                         println!(" ** start ** edges: [{}, {}] span: {}", in_idx, i, winding.span_index);
 
+                        self.spans.begin(
+                            winding.span_index,
+                            &self.pending_edges[in_idx],
+                            &self.pending_edges[i],
+                        );
                     }
                 }
                 Transition::None => {}
@@ -554,18 +604,51 @@ impl FillTessellator {
 
         println!("sweep line: {}", self.active.edges.len());
         for e in &self.active.edges {
-            println!("| {} -> {}", e.from, e.to);
+            if e.is_merge {
+                println!("| (merge) {}", e.to);
+            } else {
+                println!("| {} -> {}", e.from, e.to);
+            }
         }
     }
 
+    fn insert(&mut self, idx: usize, e: &PendingEdge) {
+    }
+
     fn update_active_edges(&mut self, above: Range<usize>) {
+        // Remove all edges from the "above" range except merge
+        // vertices.
+
+        let mut rm_index = above.start;
+        for _ in 0..(above.end - above.start) {
+            if self.active.edges[rm_index].is_merge {
+                rm_index += 1
+            } else {
+                self.active.edges.remove(rm_index);
+                self.active.aux.remove(rm_index);
+            }
+        }
+
+        // Insert the pending edges.
 
         let first_edge_below = above.start;
+        for (i, edge) in self.pending_edges.drain(..).enumerate() {
+            let idx = first_edge_below + i;
 
-        self.active.remove(above);
+            self.active.edges.insert(idx, ActiveEdge {
+                from: edge.from,
+                to: edge.to,
+                ctrl: edge.ctrl,
+                range_start: edge.range_start,
+                winding: edge.winding,
+                is_merge: false,
+            });
 
-        for (i, pending_edge) in self.pending_edges.drain(..).enumerate() {
-            self.active.insert(first_edge_below + i, &pending_edge);
+            self.active.aux.insert(idx, ActiveEdgeAux {
+                from_id: edge.from_id,
+                to_id: edge.to_id,
+                ctrl_id: edge.ctrl_id,
+            });
         }
     }
 
@@ -574,36 +657,13 @@ impl FillTessellator {
             b.angle.partial_cmp(&a.angle).unwrap_or(Ordering::Equal)
         });
     }
-
-    fn points_are_equal(&self, a: Point, b: Point) -> bool {
-        // TODO: Use the tolerance threshold.
-        a == b
-    }
-
-    fn is_inside(&self, winding_number: i16) -> bool {
-        match self.options.fill_rule {
-            FillRule::EvenOdd => { winding_number % 2 != 0 }
-            FillRule::NonZero => { winding_number != 0 }
-        }
-    }
-
-    fn transition(&self, prev_winding: i16, new_winding: i16) -> Transition {
-        match (self.is_inside(prev_winding), self.is_inside(new_winding)) {
-            (false, true) => Transition::In,
-            (true, false) => Transition::Out,
-            _ => Transition::None,
-        }
-    }
-
-    fn update_winding(&self, winding: &mut WindingState, edge_winding: i16) {
-        let prev_winding_number = winding.number;
-        winding.number += edge_winding;
-        winding.transition = self.transition(prev_winding_number, winding.number);
-        if winding.transition == Transition::In {
-            winding.span_index += 1;
-        }
-    }
 }
+
+fn points_are_equal(a: Point, b: Point) -> bool {
+    // TODO: Use the tolerance threshold.
+    a == b
+}
+
 
 fn compare_positions(a: Point, b: Point) -> Ordering {
     if a.y > b.y {
@@ -627,7 +687,7 @@ fn is_after(a: Point, b: Point) -> bool {
 }
 
 #[test]
-fn new_tess() {
+fn new_tess1() {
     println!("");
 
     let mut builder = Builder::new();
@@ -646,6 +706,29 @@ fn new_tess() {
     builder.line_to(point(25.0, 9.0));
     builder.close();
 
+
+    let path = builder.build();
+
+    let mut tess = FillTessellator::new();
+
+    tess.tessellate_path(&path, &FillOptions::default());
+
+    panic!();
+}
+
+#[test]
+fn new_tess_merge() {
+    println!("");
+
+    let mut builder = Builder::new();
+    builder.move_to(point(0.0, 0.0));  // start
+    builder.line_to(point(5.0, 5.0));  // merge
+    builder.line_to(point(5.0, 1.0));  // start
+    builder.line_to(point(10.0, 6.0)); // merge
+    builder.line_to(point(11.0, 2.0)); // start
+    builder.line_to(point(11.0, 10.0));// end
+    builder.line_to(point(0.0, 9.0));  // left
+    builder.close();
 
     let path = builder.build();
 
