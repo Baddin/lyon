@@ -1,10 +1,10 @@
-use std::mem::{replace, swap};
+//use std::mem::{replace, swap};
 use std::cmp::Ordering;
 
 use {FillOptions, FillRule};
 use geom::math::*;
 use geom::LineSegment;
-use geometry_builder::{GeometryBuilder, VertexId};
+use geometry_builder::VertexId;
 use std::ops::Range;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -15,16 +15,20 @@ impl SegmentId {
     fn to_usize(&self) -> usize { self.0 as usize }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct Segment {
     from: VertexId,
+    to: VertexId,
     ctrl: VertexId,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct SubPathInfo {
     range: Range<usize>,
     is_closed: bool,
 }
 
+#[derive(Clone, Debug)]
 pub struct Path {
     points: Vec<Point>,
     segments: Vec<Segment>,
@@ -88,6 +92,33 @@ impl Path {
     fn point(&self, id: VertexId) -> Point {
         self.points[id.0 as usize]
     }
+
+
+    fn sort(&self, events: &mut Vec<Event>) {
+        for sub_path in &self.sub_paths {
+            if sub_path.range.end - sub_path.range.start < 2 {
+                continue;
+            }
+            for i in sub_path.range.clone() {
+                events.push(Event {
+                    vertex: self.segments[i].from,
+                    segment: SegmentId::from_usize(i),
+                });
+            }
+        }
+
+        events.sort_by(|a, b| {
+            compare_positions(
+                self.points[b.vertex.0 as usize],
+                self.points[a.vertex.0 as usize],
+            )
+        });
+    }
+}
+
+struct Event {
+    vertex: VertexId,
+    segment: SegmentId,
 }
 
 pub struct Builder {
@@ -108,11 +139,12 @@ impl Builder {
 
         let from = VertexId((self.path.points.len() - 1) as u16);
         let ctrl = VertexId(from.0 + 1);
+        let to = VertexId(from.0 + 2);
 
         self.path.points.push(ctrl_pos);
         self.path.points.push(to_pos);
 
-        self.path.segments.push(Segment{ from, ctrl });
+        self.path.segments.push(Segment{ from, ctrl, to });
     }
 
     pub fn line_to(&mut self, to_pos: Point) {
@@ -122,10 +154,11 @@ impl Builder {
 
         let from = VertexId((self.path.points.len() - 1) as u16);
         let ctrl = from;
+        let to = VertexId(from.0 + 1);
 
         self.path.points.push(to_pos);
 
-        self.path.segments.push(Segment{ from, ctrl });
+        self.path.segments.push(Segment{ from, ctrl, to });
     }
 
     pub fn move_to(&mut self, to_pos: Point) {
@@ -138,12 +171,22 @@ impl Builder {
     }
 
     fn end_sub_path(&mut self, is_closed: bool) {
-        let sp_end = self.path.segments.len();
+        let mut sp_end = self.path.segments.len();
         let sp_start = self.path.sub_paths.last()
             .map(|sp| sp.range.end)
             .unwrap_or(0);
 
         if sp_end >= sp_start {
+            if is_closed && !self.path.points.is_empty() {
+                let first = self.path.sub_paths.last().map(|sp|{
+                    self.path.segments[sp.range.start].from.0 as usize
+                }).unwrap_or(0);
+                let first_point = self.path.points[first];
+                self.line_to(first_point);
+
+                sp_end += 1;
+            }
+
             self.path.sub_paths.push(SubPathInfo {
                 range: sp_start..sp_end,
                 is_closed,
@@ -156,41 +199,11 @@ impl Builder {
     }
 }
 
-struct Events {
-    sorted: Vec<SegmentId>,
-}
-
-impl Events {
-    fn set_path(&mut self, path: &Path) {
-        self.sorted.clear();
-
-        let mut event_positions = Vec::new();
-
-        for sub_path in &path.sub_paths {
-            if sub_path.range.end - sub_path.range.start < 2 {
-                continue;
-            }
-            for i in sub_path.range.clone() {
-                self.sorted.push(SegmentId::from_usize(i));
-                let vertex_id = path.segments[i].from;
-                event_positions.push(path.points[vertex_id.0 as usize]);
-            }
-        }
-
-        self.sorted.sort_by(|a, b| {
-            compare_positions(
-                event_positions[b.to_usize()],
-                event_positions[a.to_usize()]
-            )
-        });
-    }
-}
-
 pub struct FillTessellator {
-    active_edges: Vec<ActiveEdge>,
+    active: ActiveEdges,
     pending_edges: Vec<PendingEdge>,
     options: FillOptions,
-    events: Events,
+    events: Vec<Event>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -214,12 +227,46 @@ struct ActiveEdge {
 
     range_start: f32,
 
+    winding: i16,
+    is_merge: bool,
+}
+
+struct ActiveEdgeAux {
     from_id: VertexId,
     ctrl_id: VertexId,
     to_id: VertexId,
+}
 
-    winding: i16,
-    is_merge: bool,
+struct ActiveEdges {
+    edges: Vec<ActiveEdge>,
+    aux: Vec<ActiveEdgeAux>,
+}
+
+impl ActiveEdges {
+    fn insert(&mut self, idx: usize, e: &PendingEdge) {
+        self.edges.insert(idx, ActiveEdge {
+            from: e.from,
+            to: e.to,
+            ctrl: e.ctrl,
+            range_start: e.range_start,
+            winding: e.winding,
+            is_merge: false,
+        });
+
+        self.aux.insert(idx, ActiveEdgeAux {
+            from_id: e.from_id,
+            to_id: e.to_id,
+            ctrl_id: e.ctrl_id,
+        });
+    }
+
+    fn remove(&mut self, range: Range<usize>) {
+        let count = range.end - range.start;
+        for _ in 0..count {
+            self.edges.remove(range.start);
+            self.aux.remove(range.start);
+        }
+    }
 }
 
 struct PendingEdge {
@@ -250,12 +297,13 @@ impl ActiveEdge {
 impl FillTessellator {
     pub fn new() -> Self {
         FillTessellator {
-            active_edges: Vec::new(),
+            active: ActiveEdges {
+                edges: Vec::new(),
+                aux: Vec::new(),
+            },
             pending_edges: Vec::new(),
             options: FillOptions::default(),
-            events: Events {
-                sorted: Vec::new(),
-            },
+            events: Vec::new(),
         }
     }
 
@@ -266,13 +314,14 @@ impl FillTessellator {
     ) {
         self.options = options.clone();
 
-        self.events.set_path(path);
+        path.sort(&mut self.events);
 
         self.tessellator_loop(path);
     }
 
     fn tessellator_loop(&mut self, path: &Path) {
-        while let Some(segment_id_a) = self.events.sorted.pop() {
+        while let Some(event) = self.events.pop() {
+            let segment_id_a = event.segment;
             let current_vertex_id = path.segment_from(segment_id_a);
             let segment_id_b = path.previous_segment(segment_id_a);
             let endpoint_id_b = path.segment_from(segment_id_b);
@@ -337,12 +386,13 @@ impl FillTessellator {
     fn process_events(
         &mut self,
         current_pos: Point,
-        current_vertex_id: VertexId,
+        _current_vertex_id: VertexId,
         edges_above: u32,
     ) {
-        println!(" --- events at {} {}                       {}/{}",
+        println!("");
+        println!(" --- events at [{}, {}]                       {} -> {}",
             current_pos.x, current_pos.y,
-            self.pending_edges.len(), edges_above
+            edges_above, self.pending_edges.len(),
         );
 
         let mut winding = WindingState {
@@ -351,8 +401,7 @@ impl FillTessellator {
             transition: Transition::None,
         };
         let mut winding_below = None;
-        let mut connecting_edge_start = self.active_edges.len();
-        let mut connecting_edge_end = self.active_edges.len();
+        let mut above = self.active.edges.len()..self.active.edges.len();
         let mut connecting_edges = false;
         let mut first_transition_above = true;
         let mut pending_merge = None;
@@ -361,7 +410,7 @@ impl FillTessellator {
 
         // First go through the sweep line until we find an edge that touches
         // the current position.
-        for (i, active_edge) in self.active_edges.iter().enumerate() {
+        for (i, active_edge) in self.active.edges.iter().enumerate() {
             if active_edge.is_merge {
                 continue;
             }
@@ -375,6 +424,7 @@ impl FillTessellator {
                 }
             } else {
                 let ex = active_edge.solve_x_for_y(current_pos.y);
+                println!("ex: {}", ex);
 
                 if ex == current_pos.x {
                     connecting_edges = true;
@@ -383,14 +433,15 @@ impl FillTessellator {
                 }
 
                 if ex > current_pos.x {
-                    connecting_edge_end = i;
+                    above.end = i;
                     break;
                 }
             }
 
             if !was_connecting_edges && connecting_edges {
+                println!("begin connecting edges");
                 winding_below = Some(winding.clone());
-                connecting_edge_start = i;
+                above.start = i;
             }
 
             self.update_winding(&mut winding, active_edge.winding);
@@ -398,6 +449,8 @@ impl FillTessellator {
             if !connecting_edges {
                 continue;
             }
+
+            println!("{:?}", winding.transition);
 
             match winding.transition {
                 Transition::Out => {
@@ -411,9 +464,10 @@ impl FillTessellator {
                         }
                     } else if let Some(in_idx) = prev_transition_in.take() {
 
-                        println!(" ** end ** edges: [{}, ??] span: {}", in_idx, winding.span_index);
-
-                        //self.end_event(in_idx, i, winding.span_index);
+                        println!(" ** end ** edges: [{}, {}] span: {}",
+                            in_idx, i,
+                            winding.span_index
+                        );
 
                     } else {
                         // TODO: ??
@@ -431,6 +485,11 @@ impl FillTessellator {
             }
         }
 
+        // Fix up above index range in case there was no connecting edges.
+        above.start = usize::min(above.start, above.end);
+
+        println!("connecting edges: {}..{}", above.start, above.end);
+
         let mut winding = winding_below.unwrap_or(winding);
         let mut prev_transition_in = None;
 
@@ -443,9 +502,9 @@ impl FillTessellator {
             //   ...x
             //   ....\
             //
+
             println!(" ** right ** edge: {} span: {}", idx, winding.span_index);
 
-            self.pending_edges.remove(0);
         } else if let Some(in_idx) = pending_merge {
             // Merge event.
             //
@@ -454,12 +513,11 @@ impl FillTessellator {
             // .....x.....
             //
 
-            //let out_idx =
-            //self.merge_event(in_idx, out_idx, winding.span_index);
-            println!(" ** merge ** edges: [{}, ??] span: {}", in_idx, winding.span_index);
+            println!(" ** merge ** edges: [{}, {}] span: {}",
+                in_idx, above.end - 1,
+                winding.span_index
+            );
 
-            self.pending_edges.remove(0);
-            self.pending_edges.pop();
         } else if !self.is_inside(winding.number) && self.pending_edges.len() % 2 == 1 {
             // Left event.
             //
@@ -468,10 +526,11 @@ impl FillTessellator {
             //     \...
             //
 
-            println!(" ** left ** edge ?? span: {}", winding.span_index);
-
-            self.pending_edges.pop();
+            println!(" ** left ** edge {} span: {}", above.start, winding.span_index);
         }
+
+        // Go through the edges starting at the current point and emmit
+        // start events.
 
         for (i, pending_edge) in self.pending_edges.iter().enumerate() {
             self.update_winding(&mut winding, pending_edge.winding);
@@ -484,7 +543,6 @@ impl FillTessellator {
                     if let Some(in_idx) = prev_transition_in {
 
                         println!(" ** start ** edges: [{}, {}] span: {}", in_idx, i, winding.span_index);
-                        //self.start_event(in_idx, i, winding.span_index);
 
                     }
                 }
@@ -492,44 +550,28 @@ impl FillTessellator {
             }
         }
 
-        let num_edges_to_remove = connecting_edge_end as i32 - connecting_edge_start as i32;
-        let num_edges_to_add = self.pending_edges.len();
+        self.update_active_edges(above);
 
-        if num_edges_to_remove > 0 {
-            for _ in 0..num_edges_to_remove {
-                self.active_edges.remove(connecting_edge_start);
-            }
+        println!("sweep line: {}", self.active.edges.len());
+        for e in &self.active.edges {
+            println!("| {} -> {}", e.from, e.to);
         }
+    }
 
-        if num_edges_to_add > 0 {
-            let offset = usize::min(connecting_edge_start, connecting_edge_end);
-            for i in 0..num_edges_to_add {
-                let e = &self.pending_edges[offset + i];
-                self.active_edges.insert(offset + i, ActiveEdge {
-                    from: e.from,
-                    to: e.to,
-                    ctrl: e.ctrl,
+    fn update_active_edges(&mut self, above: Range<usize>) {
 
-                    range_start: e.range_start,
+        let first_edge_below = above.start;
 
-                    from_id: e.from_id,
-                    ctrl_id: e.ctrl_id,
-                    to_id: e.to_id,
+        self.active.remove(above);
 
-                    winding: e.winding,
-                    is_merge: false,
-                });
-            }
+        for (i, pending_edge) in self.pending_edges.drain(..).enumerate() {
+            self.active.insert(first_edge_below + i, &pending_edge);
         }
-
-        self.pending_edges.clear();
-
-        println!("                                        sl.len: {}", self.active_edges.len());
     }
 
     fn sort_ending_edges(&mut self) {
         self.pending_edges.sort_by(|a, b| {
-            a.angle.partial_cmp(&b.angle).unwrap_or(Ordering::Equal)
+            b.angle.partial_cmp(&a.angle).unwrap_or(Ordering::Equal)
         });
     }
 
@@ -598,6 +640,12 @@ fn new_tess() {
     builder.line_to(point(0.0, 10.0));
     builder.line_to(point(1.0, 5.0));
     builder.close();
+
+    builder.move_to(point(20.0, -1.0));
+    builder.line_to(point(25.0, 1.0));
+    builder.line_to(point(25.0, 9.0));
+    builder.close();
+
 
     let path = builder.build();
 
